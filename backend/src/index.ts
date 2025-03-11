@@ -14,110 +14,94 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 
 if (!OPENROUTER_API_KEY || !SERPER_API_KEY) {
-  throw new Error("Missing API keys in .env file");
+    throw new Error("Missing API keys in .env file");
 }
 
 
-const fetchCompetitors = async (website: string): Promise<{ url: string; description: string }[]> => {
-  try {
-    const response = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        model: "openai/gpt-4o",
-        messages: [
-          {
-            role: "system",
-            content: `You are an SEO expert. Given a website, return exactly 10 competitors in a **valid JSON array** format. 
-                      Strictly use this format: 
-                      [{"url": "https://competitor.com", "description": "A brief description"}]
-                      **DO NOT** include any additional text, explanations, or markdown formatting. **Only return the JSON array.**`
-          },
-          {
-            role: "user",
-            content: `Find competitors for: ${website}`
-          }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    if (!response.data.choices || !response.data.choices.length) {
-      throw new Error("Invalid API response (No choices returned)");
-    }
-
-    let jsonResponse = response.data.choices[0].message.content.trim();
-
-    console.log("Raw OpenRouter Response:", jsonResponse);
-
-    if (jsonResponse.startsWith('"') && jsonResponse.endsWith('"')) {
-      jsonResponse = jsonResponse.slice(1, -1).replace(/\\"/g, '"');
-    }
-
+const fetchSearchResultsFromSerper = async (website: string) => {
     try {
-      const competitors: { url: string; description: string }[] = JSON.parse(jsonResponse);
-      return competitors.slice(0, 10);
-    } catch (parseError) {
-      console.error("JSON Parsing Error:", parseError);
-      throw new Error("Failed to parse OpenRouter API response");
+        const query = `related:${website} OR "competitors of ${website}" OR "alternative to ${website}" OR site:${website}`;
+        
+        const response = await axios.post(
+            "https://google.serper.dev/search",
+            { q: query, num: 20 }, // Fetch 20 results
+            { headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" } }
+        );
+
+        if (!response.data.organic || response.data.organic.length === 0) {
+            throw new Error(`No competitor data found for ${website}`);
+        }
+
+        const results = response.data.organic.map((result: any) => ({
+            title: result.title,
+            link: result.link,
+            snippet: result.snippet,
+            publishedDate: result.date ?? "Unknown", // Some results contain a published date
+        }));
+
+        return results;
+    } catch (error: any) {
+        console.error(`Error fetching competitors for ${website}:`, error.response?.data || error.message);
+        return [];
     }
-  } catch (error) {
-    console.error("Error fetching competitors:", error);
-    return [];
-  }
 };
 
+const extractCompetitorInformation = async (website: string, searchResults: any) => {
+    try {
 
-const fetchCompetitorDetails = async (url: string): Promise<{ logo: string | null; traffic: number }> => {
-  try {
-    const response = await axios.post(
-      "https://serper.dev/search",
-      { q: url },
-      { headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" } }
-    );
+        const response = await axios.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            {
+                model: "openai/gpt-4o",
+                messages: [
+                    {
+                        role: "user",
+                        content: `Analyze these search results for ${website} competitors: ${JSON.stringify(searchResults)}.
+                        Return only 10 competitors with:
+                      - "url": Competitor Name - url
+                      - "description": Short description of the competitor
+                      - "traffic": Relevance score (0-100)
+                      - "logo": Competitor website URL Return ONLY a JSON object with this exact structure: {
+                        "competitors": [{"url": "string","description": "string", "traffic": number, "logo": "url"}]
+                      }
+                      No explanations, notes, or markdown formatting. Only valid JSON.`
+                    }
+                ],
+                response_format: { type: "json_object" }
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+                    "Content-Type": "application/json"
+                }
+            }
+        );
 
-    if (!response.data.organic || response.data.organic.length === 0) {
-      return { logo: null, traffic: Math.floor(Math.random() * 100000) };
+        const rawResponse = response.data.choices[0].message.content;
+        const jsonString = rawResponse.replace(/```json/g, "").replace(/```/g, "").trim();
+
+        return JSON.parse(jsonString);
+    } catch (error) {
+        console.error("OpenRouter API error:", error);
+        return { competitors: [] };
     }
-
-    const siteData = response.data.organic[0];
-    return {
-      logo: siteData.favicon || null,
-      traffic: Math.floor(Math.random() * 100000),
-    };
-  } catch (error) {
-    console.error(`Error fetching details for ${url}:`, error);
-    return { logo: null, traffic: Math.floor(Math.random() * 100000) };
-  }
 };
 
+app.post("/api/competitors", async (req: Request, res: Response) => {
+    try {
+        const { website } = req.body;
+        if (!website) {
+            res.status(400).json({ error: "Website URL is required" });
+            return;
+        }
 
-app.post("/api/competitors", async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { website } = req.body;
-    if (!website) {
-      res.status(400).json({ error: "Website URL is required" });
-      return;
+        const searchResults = await fetchSearchResultsFromSerper(website);
+        const analyzedCompetitors = await extractCompetitorInformation(website, searchResults);
+
+        res.json(analyzedCompetitors);
+    } catch (error) {
+        res.status(500).json({ error: "Internal Server Error" });
     }
-
-    const competitors = await fetchCompetitors(website);
-
-    const detailedCompetitors = await Promise.all(
-      competitors.map(async (competitor) => {
-        const details = await fetchCompetitorDetails(competitor.url);
-        return { ...competitor, ...details };
-      })
-    );
-
-    res.json({ competitors: detailedCompetitors });
-  } catch (error) {
-    console.error("API error:", error);
-    res.status(500).json({ error: "Internal Server Error" });
-  }
 });
 
 
